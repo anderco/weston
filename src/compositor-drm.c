@@ -131,6 +131,21 @@ struct drm_fb {
 	void *map;
 };
 
+struct drm_properties {
+	uint32_t src_x;
+	uint32_t src_y;
+	uint32_t src_w;
+	uint32_t src_h;
+
+	uint32_t crtc_x;
+	uint32_t crtc_y;
+	uint32_t crtc_w;
+	uint32_t crtc_h;
+
+	uint32_t fb_id;
+	uint32_t crtc_id;
+};
+
 struct drm_output {
 	struct weston_output   base;
 
@@ -139,6 +154,7 @@ struct drm_output {
 	int pipe;
 	uint32_t connector_id;
 	drmModeCrtcPtr original_crtc;
+	struct drm_properties prop;
 
 	int vblank_pending;
 	int page_flip_pending;
@@ -170,6 +186,7 @@ struct drm_sprite {
 	struct drm_fb *current, *next;
 	struct drm_output *output;
 	struct drm_compositor *compositor;
+	struct drm_properties prop;
 
 	uint32_t possible_crtcs;
 	uint32_t plane_id;
@@ -187,6 +204,65 @@ static const char default_seat[] = "seat0";
 
 static void
 drm_output_set_cursor(struct drm_output *output);
+
+static void
+drm_properties_get_from_obj(struct drm_properties *drm_props, int fd,
+			    uint32_t obj_id, uint32_t obj_type)
+{
+	drmModeObjectPropertiesPtr props;
+	drmModePropertyPtr prop;
+	unsigned int i, j;
+	uint32_t *p;
+
+#define F(field) offsetof(struct drm_properties, field)
+	const struct {
+		char *name;
+		int offset;
+	} prop_map[] = {
+		{ "SRC_X", F(src_x) },
+		{ "SRC_Y", F(src_y) },
+		{ "SRC_W", F(src_w) },
+		{ "SRC_H", F(src_h) },
+
+		{ "CRTC_X", F(crtc_x) },
+		{ "CRTC_Y", F(crtc_y) },
+		{ "CRTC_W", F(crtc_w) },
+		{ "CRTC_H", F(crtc_h) },
+
+		{ "FB_ID", F(fb_id) },
+		{ "CRTC_ID", F(crtc_id) },
+	};
+#undef F
+
+	memset(drm_props, 0, sizeof *drm_props);
+
+	props = drmModeObjectGetProperties(fd, obj_id, obj_type);
+	if (!props)
+		return;
+
+	weston_log("drm object %u (type 0x%x) properties: ", obj_id, obj_type);
+
+	for (i = 0; i < props->count_props; i++) {
+		prop = drmModeGetProperty(fd, props->props[i]);
+		if (!prop)
+			continue;
+
+		for (j = 0; j < ARRAY_LENGTH(prop_map); j++) {
+			if (strcmp(prop->name, prop_map[j].name) != 0)
+				continue;
+
+			p = (uint32_t *) ((char *) drm_props +
+					  prop_map[j].offset);
+			*p = prop->prop_id;
+
+			weston_log_continue("%s (%u), ", prop->name,
+					    prop->prop_id);
+			break;
+		}
+	}
+
+	weston_log_continue("\n");
+}
 
 static int
 drm_sprite_crtc_supported(struct weston_output *output_base, uint32_t supported)
@@ -1521,6 +1597,9 @@ create_output_for_connector(struct drm_compositor *ec,
 
 	output->original_crtc = drmModeGetCrtc(ec->drm.fd, output->crtc_id);
 
+	drm_properties_get_from_obj(&output->prop, ec->drm.fd,
+				    output->crtc_id, DRM_MODE_OBJECT_CRTC);
+
 	/* Get the current mode on the crtc that's currently driving
 	 * this connector. */
 	encoder = drmModeGetEncoder(ec->drm.fd, connector->encoder_id);
@@ -1706,6 +1785,11 @@ create_sprites(struct drm_compositor *ec)
 		sprite->plane_id = plane->plane_id;
 		sprite->current = NULL;
 		sprite->next = NULL;
+
+		drm_properties_get_from_obj(&sprite->prop, ec->drm.fd,
+					    sprite->plane_id,
+					    DRM_MODE_OBJECT_PLANE);
+
 		sprite->compositor = ec;
 		sprite->count_formats = plane->count_formats;
 		memcpy(sprite->formats, plane->formats,
