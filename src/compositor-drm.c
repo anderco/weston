@@ -107,6 +107,8 @@ struct drm_compositor {
 
 	int use_pixman;
 
+	int has_atomic_pageflip;
+
 	uint32_t prev_state;
 };
 
@@ -155,9 +157,7 @@ struct drm_output {
 	uint32_t connector_id;
 	drmModeCrtcPtr original_crtc;
 	struct drm_properties prop;
-
-	int vblank_pending;
-	int page_flip_pending;
+	drmModePropertySetPtr prop_set;
 
 	struct gbm_surface *surface;
 	struct gbm_bo *cursor_bo[2];
@@ -192,11 +192,6 @@ struct drm_sprite {
 	uint32_t plane_id;
 	uint32_t count_formats;
 
-	int32_t src_x, src_y;
-	uint32_t src_w, src_h;
-	uint32_t dest_x, dest_y;
-	uint32_t dest_w, dest_h;
-
 	uint32_t formats[];
 };
 
@@ -204,6 +199,8 @@ static const char default_seat[] = "seat0";
 
 static void
 drm_output_set_cursor(struct drm_output *output);
+static void
+drm_output_set_sprites(struct drm_output *output);
 
 static void
 drm_properties_get_from_obj(struct drm_properties *drm_props, int fd,
@@ -618,9 +615,10 @@ drm_output_repaint(struct weston_output *output_base,
 	struct drm_output *output = (struct drm_output *) output_base;
 	struct drm_compositor *compositor =
 		(struct drm_compositor *) output->base.compositor;
-	struct drm_sprite *s;
 	struct drm_mode *mode;
 	int ret = 0;
+	int flags;
+	int force_non_atomic = 0;
 
 	if (!output->next)
 		drm_output_render(output, damage);
@@ -637,85 +635,74 @@ drm_output_repaint(struct weston_output *output_base,
 			weston_log("set mode failed: %m\n");
 			return;
 		}
+
+		/* Atomic page flip does not trigger the event if the fb
+		 * on the crtc does not change. */
+		force_non_atomic = 1;
 	}
 
-	if (drmModePageFlip(compositor->drm.fd, output->crtc_id,
-			    output->next->fb_id,
-			    DRM_MODE_PAGE_FLIP_EVENT, output) < 0) {
-		weston_log("queueing pageflip failed: %m\n");
-		return;
-	}
+	if (compositor->has_atomic_pageflip && !force_non_atomic) {
+		drm_output_set_sprites(output);
 
-	output->page_flip_pending = 1;
+		drmModePropertySetAdd(output->prop_set, output->crtc_id,
+				      output->prop.fb_id, output->next->fb_id);
+
+		flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_ATOMIC_EVENT;
+		ret = drmModePropertySetCommit(compositor->drm.fd, flags, output,
+					       output->prop_set);
+		if (ret) {
+			weston_log("queueing atomic page flip failed: %m\n");
+			return;
+		}
+	} else {
+		if (drmModePageFlip(compositor->drm.fd, output->crtc_id,
+				    output->next->fb_id,
+				    DRM_MODE_PAGE_FLIP_EVENT, output) < 0) {
+			weston_log("queueing pageflip failed: %m\n");
+			return;
+		}
+	}
 
 	drm_output_set_cursor(output);
-
-	/*
-	 * Now, update all the sprite surfaces
-	 */
-	wl_list_for_each(s, &compositor->sprite_list, link) {
-		uint32_t flags = 0, fb_id = 0;
-		drmVBlank vbl = {
-			.request.type = DRM_VBLANK_RELATIVE | DRM_VBLANK_EVENT,
-			.request.sequence = 1,
-		};
-
-		if ((!s->current && !s->next) ||
-		    !drm_sprite_crtc_supported(output_base, s->possible_crtcs))
-			continue;
-
-		if (s->next && !compositor->sprites_hidden)
-			fb_id = s->next->fb_id;
-
-		ret = drmModeSetPlane(compositor->drm.fd, s->plane_id,
-				      output->crtc_id, fb_id, flags,
-				      s->dest_x, s->dest_y,
-				      s->dest_w, s->dest_h,
-				      s->src_x, s->src_y,
-				      s->src_w, s->src_h);
-		if (ret)
-			weston_log("setplane failed: %d: %s\n",
-				ret, strerror(errno));
-
-		if (output->pipe > 0)
-			vbl.request.type |= DRM_VBLANK_SECONDARY;
-
-		/*
-		 * Queue a vblank signal so we know when the surface
-		 * becomes active on the display or has been replaced.
-		 */
-		vbl.request.signal = (unsigned long)s;
-		ret = drmWaitVBlank(compositor->drm.fd, &vbl);
-		if (ret) {
-			weston_log("vblank event request failed: %d: %s\n",
-				ret, strerror(errno));
-		}
-
-		s->output = output;
-		output->vblank_pending = 1;
-	}
-
-	return;
 }
 
 static void
-vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
-	       void *data)
+output_rotate_sprite_fbs(struct drm_output *output)
 {
-	struct drm_sprite *s = (struct drm_sprite *)data;
-	struct drm_output *output = s->output;
+	struct drm_compositor *compositor =
+		(struct drm_compositor *) output->base.compositor;
+	struct drm_sprite *s;
+
+	wl_list_for_each(s, &compositor->sprite_list, link) {
+		if (s->output != output)
+			continue;
+
+		if (s->current)
+			gbm_bo_destroy(s->current->bo);
+
+		s->current = s->next;
+		s->next = NULL;
+	}
+}
+
+static void
+atomic_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
+	       uint32_t obj_id, uint32_t old_fb_id, void *data)
+{
+	struct drm_output *output = (struct drm_output *) data;
 	uint32_t msecs;
 
-	output->vblank_pending = 0;
+	if (obj_id != output->crtc_id)
+		return;
 
-	drm_output_release_fb(output, s->current);
-	s->current = s->next;
-	s->next = NULL;
+	drm_output_release_fb(output, output->current);
+	output->current = output->next;
+	output->next = NULL;
 
-	if (!output->page_flip_pending) {
-		msecs = sec * 1000 + usec / 1000;
-		weston_output_finish_frame(&output->base, msecs);
-	}
+	output_rotate_sprite_fbs(output);
+
+	msecs = sec * 1000 + usec / 1000;
+	weston_output_finish_frame(&output->base, msecs);
 }
 
 static void
@@ -725,16 +712,12 @@ page_flip_handler(int fd, unsigned int frame,
 	struct drm_output *output = (struct drm_output *) data;
 	uint32_t msecs;
 
-	output->page_flip_pending = 0;
-
 	drm_output_release_fb(output, output->current);
 	output->current = output->next;
 	output->next = NULL;
 
-	if (!output->vblank_pending) {
-		msecs = sec * 1000 + usec / 1000;
-		weston_output_finish_frame(&output->base, msecs);
-	}
+	msecs = sec * 1000 + usec / 1000;
+	weston_output_finish_frame(&output->base, msecs);
 }
 
 static uint32_t
@@ -777,6 +760,7 @@ drm_output_prepare_overlay_surface(struct weston_output *output_base,
 				   struct weston_surface *es)
 {
 	struct weston_compositor *ec = output_base->compositor;
+	struct drm_output *output = (struct drm_output *) output_base;
 	struct drm_compositor *c =(struct drm_compositor *) ec;
 	struct drm_sprite *s;
 	int found = 0;
@@ -847,6 +831,8 @@ drm_output_prepare_overlay_surface(struct weston_output *output_base,
 	s->plane.x = box->x1;
 	s->plane.y = box->y1;
 
+	s->output = output;
+
 	/*
 	 * Calculate the source & dest rects properly based on actual
 	 * position (note the caller has called weston_surface_update_transform()
@@ -860,10 +846,16 @@ drm_output_prepare_overlay_surface(struct weston_output *output_base,
 	tbox = weston_transformed_rect(output_base->width,
 				       output_base->height,
 				       output_base->transform, *box);
-	s->dest_x = tbox.x1;
-	s->dest_y = tbox.y1;
-	s->dest_w = tbox.x2 - tbox.x1;
-	s->dest_h = tbox.y2 - tbox.y1;
+
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.crtc_x, tbox.x1);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.crtc_y, tbox.y1);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.crtc_w, tbox.x2 - tbox.x1);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.crtc_h, tbox.y2 - tbox.y1);
+
 	pixman_region32_fini(&dest_rect);
 
 	pixman_region32_init(&src_rect);
@@ -898,13 +890,41 @@ drm_output_prepare_overlay_surface(struct weston_output *output_base,
 				       wl_fixed_from_int(es->geometry.height),
 				       es->buffer_transform, tbox);
 
-	s->src_x = tbox.x1 << 8;
-	s->src_y = tbox.y1 << 8;
-	s->src_w = (tbox.x2 - tbox.x1) << 8;
-	s->src_h = (tbox.y2 - tbox.y1) << 8;
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.src_x, tbox.x1 << 8);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.src_y, tbox.y1 << 8);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.src_w, (tbox.x2 - tbox.x1) << 8);
+	drmModePropertySetAdd(output->prop_set, s->plane_id,
+			      s->prop.src_h, (tbox.y2 - tbox.y1) << 8);
+
 	pixman_region32_fini(&src_rect);
 
 	return &s->plane;
+}
+
+static void
+drm_output_set_sprites(struct drm_output *output)
+{
+	struct drm_sprite *s;
+	struct drm_compositor *compositor =
+		(struct drm_compositor *) output->base.compositor;
+
+	wl_list_for_each(s, &compositor->sprite_list, link) {
+		uint32_t fb_id = 0;
+
+		if ((!s->current && !s->next) || s->output != output)
+			continue;
+
+		if (s->next && !compositor->sprites_hidden)
+			fb_id = s->next->fb_id;
+
+		drmModePropertySetAdd(output->prop_set, s->plane_id,
+				      s->prop.fb_id, fb_id);
+		drmModePropertySetAdd(output->prop_set, s->plane_id,
+				      s->prop.crtc_id, output->crtc_id);
+	}
 }
 
 static struct weston_plane *
@@ -1208,7 +1228,9 @@ on_drm_input(int fd, uint32_t mask, void *data)
 	memset(&evctx, 0, sizeof evctx);
 	evctx.version = DRM_EVENT_CONTEXT_VERSION;
 	evctx.page_flip_handler = page_flip_handler;
-	evctx.vblank_handler = vblank_handler;
+#if DRM_EVENT_CONTEXT_VERSION >= 3
+	evctx.atomic_handler = atomic_handler;
+#endif
 	drmHandleEvent(fd, &evctx);
 
 	return 1;
@@ -1600,6 +1622,10 @@ create_output_for_connector(struct drm_compositor *ec,
 	drm_properties_get_from_obj(&output->prop, ec->drm.fd,
 				    output->crtc_id, DRM_MODE_OBJECT_CRTC);
 
+	output->prop_set = drmModePropertySetAlloc();
+	if (!output->prop_set)
+		goto err_free;
+
 	/* Get the current mode on the crtc that's currently driving
 	 * this connector. */
 	encoder = drmModeGetEncoder(ec->drm.fd, connector->encoder_id);
@@ -1741,6 +1767,7 @@ err_free:
 		free(drm_mode);
 	}
 
+	drmModePropertySetFree(output->prop_set);
 	drmModeFreeCrtc(output->original_crtc);
 	ec->crtc_allocator &= ~(1 << output->crtc_id);
 	ec->connector_allocator &= ~(1 << output->connector_id);
@@ -1757,6 +1784,12 @@ create_sprites(struct drm_compositor *ec)
 	drmModePlaneRes *plane_res;
 	drmModePlane *plane;
 	uint32_t i;
+
+	if (!ec->has_atomic_pageflip) {
+		weston_log("atomic pageflip unavailable, disabling sprites\n");
+		ec->sprites_are_broken = 1;
+		return;
+	}
 
 	plane_res = drmModeGetPlaneResources(ec->drm.fd);
 	if (!plane_res) {
@@ -2225,6 +2258,24 @@ planes_binding(struct wl_seat *seat, uint32_t time, uint32_t key, void *data)
 	}
 }
 
+static int
+atomic_ioctl_supported(int fd)
+{
+	int ret;
+	drmModePropertySetPtr set;
+
+	set = drmModePropertySetAlloc();
+
+	ret = drmModePropertySetCommit(fd, DRM_MODE_ATOMIC_TEST_ONLY,
+				       NULL, set);
+	drmModePropertySetFree(set);
+
+	if (ret)
+		return 0;
+	else
+		return 1;
+}
+
 static struct weston_compositor *
 drm_compositor_create(struct wl_display *display,
 		      int connector, const char *seat, int tty, int pixman,
@@ -2243,10 +2294,6 @@ drm_compositor_create(struct wl_display *display,
 	if (ec == NULL)
 		return NULL;
 	memset(ec, 0, sizeof *ec);
-
-	/* KMS support for sprites is not complete yet, so disable the
-	 * functionality for now. */
-	ec->sprites_are_broken = 1;
 
 	ec->use_pixman = pixman;
 
@@ -2304,6 +2351,8 @@ drm_compositor_create(struct wl_display *display,
 		weston_compositor_add_key_binding(&ec->base, key,
 						  MODIFIER_CTRL | MODIFIER_ALT,
 						  switch_vt_binding, ec);
+
+	ec->has_atomic_pageflip = atomic_ioctl_supported(ec->drm.fd);
 
 	wl_list_init(&ec->sprite_list);
 	create_sprites(ec);
