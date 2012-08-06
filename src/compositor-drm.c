@@ -146,6 +146,12 @@ struct drm_properties {
 
 	uint32_t fb_id;
 	uint32_t crtc_id;
+
+	uint32_t cursor_id;
+	uint32_t cursor_x;
+	uint32_t cursor_y;
+	uint32_t cursor_w;
+	uint32_t cursor_h;
 };
 
 struct drm_output {
@@ -228,6 +234,13 @@ drm_properties_get_from_obj(struct drm_properties *drm_props, int fd,
 
 		{ "FB_ID", F(fb_id) },
 		{ "CRTC_ID", F(crtc_id) },
+
+		{ "CURSOR_ID", F(cursor_id) },
+		{ "CURSOR_X", F(cursor_x) },
+		{ "CURSOR_Y", F(cursor_y) },
+		{ "CURSOR_W", F(cursor_w) },
+		{ "CURSOR_H", F(cursor_h) },
+
 	};
 #undef F
 
@@ -642,6 +655,7 @@ drm_output_repaint(struct weston_output *output_base,
 	}
 
 	if (compositor->has_atomic_pageflip && !force_non_atomic) {
+		drm_output_set_cursor(output);
 		drm_output_set_sprites(output);
 
 		drmModePropertySetAdd(output->prop_set, output->crtc_id,
@@ -661,9 +675,9 @@ drm_output_repaint(struct weston_output *output_base,
 			weston_log("queueing pageflip failed: %m\n");
 			return;
 		}
-	}
 
-	drm_output_set_cursor(output);
+		drm_output_set_cursor(output);
+	}
 }
 
 static void
@@ -956,6 +970,28 @@ drm_output_prepare_cursor_surface(struct weston_output *output_base,
 }
 
 static void
+drm_output_propset_set_cursor(struct drm_output *output, uint32_t handle,
+			      uint32_t width, uint32_t height)
+{
+	drmModePropertySetAdd(output->prop_set, output->crtc_id,
+			      output->prop.cursor_id, handle);
+	drmModePropertySetAdd(output->prop_set, output->crtc_id,
+			      output->prop.cursor_w, width);
+	drmModePropertySetAdd(output->prop_set, output->crtc_id,
+			      output->prop.cursor_h, height);
+}
+
+static void
+drm_output_propset_move_cursor(struct drm_output *output,
+			       int32_t x, int32_t y)
+{
+	drmModePropertySetAdd(output->prop_set, output->crtc_id,
+			      output->prop.cursor_x, x);
+	drmModePropertySetAdd(output->prop_set, output->crtc_id,
+			      output->prop.cursor_y, y);
+}
+
+static void
 drm_output_set_cursor(struct drm_output *output)
 {
 	struct weston_surface *es = output->cursor_surface;
@@ -969,7 +1005,10 @@ drm_output_set_cursor(struct drm_output *output)
 
 	output->cursor_surface = NULL;
 	if (es == NULL) {
-		drmModeSetCursor(c->drm.fd, output->crtc_id, 0, 0, 0);
+		if (c->has_atomic_pageflip)
+			drm_output_propset_set_cursor(output, 0, 0, 0);
+		else
+			drmModeSetCursor(c->drm.fd, output->crtc_id, 0, 0, 0);
 		return;
 	}
 
@@ -990,20 +1029,29 @@ drm_output_set_cursor(struct drm_output *output)
 			weston_log("failed update cursor: %m\n");
 
 		handle = gbm_bo_get_handle(bo).s32;
-		if (drmModeSetCursor(c->drm.fd,
-				     output->crtc_id, handle, 64, 64)) {
-			weston_log("failed to set cursor: %m\n");
-			c->cursors_are_broken = 1;
-		}
+
+		if (c->has_atomic_pageflip)
+			drm_output_propset_set_cursor(output, handle, 64, 64);
+		else
+			if (drmModeSetCursor(c->drm.fd,
+					     output->crtc_id, handle,
+					     64, 64)) {
+				weston_log("failed to set cursor: %m\n");
+				c->cursors_are_broken = 1;
+			}
 	}
 
 	x = es->geometry.x - output->base.x;
 	y = es->geometry.y - output->base.y;
 	if (output->cursor_plane.x != x || output->cursor_plane.y != y) {
-		if (drmModeMoveCursor(c->drm.fd, output->crtc_id, x, y)) {
-			weston_log("failed to move cursor: %m\n");
-			c->cursors_are_broken = 1;
-		}
+		if (c->has_atomic_pageflip)
+			drm_output_propset_move_cursor(output, x, y);
+		else
+			if (drmModeMoveCursor(c->drm.fd, output->crtc_id,
+					      x, y)) {
+				weston_log("failed to move cursor: %m\n");
+				c->cursors_are_broken = 1;
+			}
 
 		output->cursor_plane.x = x;
 		output->cursor_plane.y = y;
