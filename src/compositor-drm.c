@@ -1047,8 +1047,13 @@ init_drm(struct drm_compositor *ec, struct udev_device *device)
 }
 
 static int
+drm_output_init_egl(struct drm_output *output, struct drm_compositor *ec);
+
+static int
 init_egl(struct drm_compositor *ec)
 {
+	struct drm_output *output;
+
 	ec->gbm = gbm_create_device(ec->drm.fd);
 
 	if (gl_renderer_create(&ec->base, ec->gbm, gl_renderer_opaque_attribs,
@@ -1056,6 +1061,14 @@ init_egl(struct drm_compositor *ec)
 		gbm_device_destroy(ec->gbm);
 		return -1;
 	}
+
+	wl_list_for_each(output, &ec->base.output_list, base.link)
+		if (drm_output_init_egl(output, ec) < 0) {
+			weston_log("Failed to init egl state for output %s\n",
+				   output->name);
+			weston_output_destroy(&output->base);
+			wl_list_remove(&output->base.link);
+		}
 
 	return 0;
 }
@@ -1421,11 +1434,6 @@ create_output_for_connector(struct drm_compositor *ec,
 			   connector->mmWidth, connector->mmHeight,
 			   o ? o->transform : WL_OUTPUT_TRANSFORM_NORMAL);
 
-	if (drm_output_init_egl(output, ec) < 0) {
-		weston_log("Failed to init output gl state\n");
-		goto err_output;
-	}
-
 	output->backlight = backlight_init(drm_device,
 					   connector->connector_type);
 	if (output->backlight) {
@@ -1459,8 +1467,6 @@ create_output_for_connector(struct drm_compositor *ec,
 
 	return 0;
 
-err_output:
-	weston_output_destroy(&output->base);
 err_free:
 	wl_list_for_each_safe(drm_mode, next, &output->base.mode_list,
 							base.link) {
@@ -2249,11 +2255,6 @@ drm_compositor_create(struct wl_display *display,
 		goto err_udev_dev;
 	}
 
-	if (init_egl(ec) < 0) {
-		weston_log("failed to initialize egl\n");
-		goto err_udev_dev;
-	}
-
 	ec->base.destroy = drm_destroy;
 	ec->base.restore = drm_restore;
 
@@ -2272,6 +2273,11 @@ drm_compositor_create(struct wl_display *display,
 	if (create_outputs(ec, connector, drm_device) < 0) {
 		weston_log("failed to create output for %s\n", path);
 		goto err_sprite;
+	}
+
+	if (init_egl(ec) < 0) {
+		weston_log("failed to initialize egl\n");
+		goto err_udev_dev;
 	}
 
 	path = NULL;
