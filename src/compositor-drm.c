@@ -44,6 +44,7 @@
 #include "gl-renderer.h"
 #include "evdev.h"
 #include "launcher-util.h"
+#include "logo.h"
 
 static int option_current_mode = 0;
 static char *output_name;
@@ -1388,6 +1389,57 @@ drm_output_init_egl(struct drm_output *output, struct drm_compositor *ec)
 	return 0;
 }
 
+static void
+load_splash(void *data, int width, int height, int stride)
+{
+	void *p, *q;
+	int i;
+	int x, y;
+
+	x = width / 2 - (logo_width / 2);
+	y = height / 2 - (logo_height / 2);
+
+	p = data + y * stride + x * 4;
+	q = logo_data;
+
+	for (i = 0; i < logo_height; i++) {
+		memcpy(p, q, logo_width * 4);
+
+		p += stride;
+		q += logo_stride;
+	}
+}
+
+static void
+drm_output_show_splash_screen(struct drm_output *output)
+{
+	struct drm_compositor *ec = (struct drm_compositor *)
+		output->base.compositor;
+	struct drm_fb *splash;
+	struct drm_mode *mode;
+	int ret;
+
+	mode = (struct drm_mode *) output->base.current;
+
+	splash = drm_fb_create_dumb(ec, mode->base.width, mode->base.height);
+	if (!splash) {
+		weston_log("failed to create dumb fb for splash screen\n");
+		return;
+	}
+
+	load_splash(splash->map, mode->base.width, mode->base.height,
+		    splash->stride);
+
+	ret = drmModeSetCrtc(ec->drm.fd, output->crtc_id,
+			     splash->fb_id, 0, 0,
+			     &output->connector_id, 1,
+			     &mode->mode_info);
+	if (ret)
+		weston_log("splash screen mode set failed\n");
+	else
+		output->current = splash;
+}
+
 static int
 create_output_for_connector(struct drm_compositor *ec,
 			    drmModeRes *resources,
@@ -1543,6 +1595,8 @@ create_output_for_connector(struct drm_compositor *ec,
 
 	weston_plane_init(&output->cursor_plane, 0, 0);
 	weston_plane_init(&output->fb_plane, 0, 0);
+
+	drm_output_show_splash_screen(output);
 
 	weston_log("Output %s, (connector %d, crtc %d)\n",
 		   output->name, output->connector_id, output->crtc_id);
