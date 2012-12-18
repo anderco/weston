@@ -128,7 +128,9 @@ drm_backend_la_SOURCES =			\
 	launcher-util.c				\
 	launcher-util.h				\
 	libbacklight.c				\
-	libbacklight.h
+	libbacklight.h				\
+	logo.c					\
+	logo.h
 endif
 
 if ENABLE_WAYLAND_COMPOSITOR
