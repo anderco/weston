@@ -495,6 +495,19 @@ drm_output_render_gl(struct drm_output *output, pixman_region32_t *damage)
 	}
 }
 
+static int
+drm_output_needs_mode_set(struct drm_output *output)
+{
+	if (!output->current)
+		return 1;
+
+	/* i915 can't change the stride with a page flip */
+	if (output->next->stride != output->current->stride)
+		return 1;
+
+	return 0;
+}
+
 static void
 drm_output_render_pixman(struct drm_output *output, pixman_region32_t *damage)
 {
@@ -553,7 +566,7 @@ drm_output_repaint(struct weston_output *output_base,
 		return;
 
 	mode = container_of(output->base.current, struct drm_mode, base);
-	if (!output->current) {
+	if (drm_output_needs_mode_set(output)) {
 		ret = drmModeSetCrtc(compositor->drm.fd, output->crtc_id,
 				     output->next->fb_id, 0, 0,
 				     &output->connector_id, 1,
