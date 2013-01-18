@@ -365,21 +365,21 @@ debug_binding(struct wl_seat *seat, uint32_t time, uint32_t key,
 WL_EXPORT int
 pixman_renderer_init(struct weston_compositor *ec)
 {
-	struct weston_renderer *renderer;
+	struct pixman_renderer *renderer;
 
 	renderer = malloc(sizeof *renderer);
 	if (renderer == NULL)
 		return -1;
 
-	renderer->read_pixels = pixman_renderer_read_pixels;
-	renderer->repaint_output = pixman_renderer_repaint_output;
-	renderer->flush_damage = pixman_renderer_flush_damage;
-	renderer->attach = pixman_renderer_attach;
-	renderer->create_surface = pixman_renderer_create_surface;
-	renderer->surface_set_color = pixman_renderer_surface_set_color;
-	renderer->destroy_surface = pixman_renderer_destroy_surface;
-	renderer->destroy = pixman_renderer_destroy;
-	ec->renderer = renderer;
+	renderer->base.read_pixels = pixman_renderer_read_pixels;
+	renderer->base.repaint_output = pixman_renderer_repaint_output;
+	renderer->base.flush_damage = pixman_renderer_flush_damage;
+	renderer->base.attach = pixman_renderer_attach;
+	renderer->base.create_surface = pixman_renderer_create_surface;
+	renderer->base.surface_set_color = pixman_renderer_surface_set_color;
+	renderer->base.destroy_surface = pixman_renderer_destroy_surface;
+	renderer->base.destroy = pixman_renderer_destroy;
+	ec->renderer = &renderer->base;
 
 	weston_compositor_add_debug_binding(ec, KEY_R,
 					    debug_binding, ec);
