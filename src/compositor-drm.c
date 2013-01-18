@@ -42,6 +42,7 @@
 
 #include "compositor.h"
 #include "gl-renderer.h"
+#include "pixman-renderer.h"
 #include "evdev.h"
 #include "launcher-util.h"
 #include "logo.h"
@@ -105,6 +106,8 @@ struct drm_compositor {
 
 	int cursors_are_broken;
 
+	int use_pixman;
+
 	uint32_t prev_state;
 };
 
@@ -146,6 +149,11 @@ struct drm_output {
 	int current_cursor;
 	struct drm_fb *current, *next;
 	struct backlight *backlight;
+
+	struct drm_fb *dumb[2];
+	pixman_image_t *image[2];
+	int current_image;
+	pixman_region32_t previous_damage;
 };
 
 /*
@@ -256,7 +264,7 @@ drm_fb_create_dumb(struct drm_compositor *ec, unsigned width, unsigned height)
 	if (ret)
 		goto err_add_fb;
 
-	fb->map = mmap(0, fb->size, PROT_WRITE,
+	fb->map = mmap(0, fb->size, PROT_READ | PROT_WRITE,
 		       MAP_SHARED, ec->drm.fd, map_arg.offset);
 	if (fb->map == MAP_FAILED)
 		goto err_add_fb;
@@ -374,6 +382,8 @@ drm_fb_set_buffer(struct drm_fb *fb, struct wl_buffer *buffer)
 static void
 drm_output_release_fb(struct drm_output *output, struct drm_fb *fb)
 {
+	return;
+
 	if (!fb)
 		return;
 
@@ -465,16 +475,13 @@ drm_output_prepare_scanout_surface(struct weston_output *_output,
 }
 
 static void
-drm_output_render(struct drm_output *output, pixman_region32_t *damage)
+drm_output_render_gl(struct drm_output *output, pixman_region32_t *damage)
 {
 	struct drm_compositor *c =
 		(struct drm_compositor *) output->base.compositor;
 	struct gbm_bo *bo;
 
 	c->base.renderer->repaint_output(&output->base, damage);
-
-	pixman_region32_subtract(&c->base.primary_plane.damage,
-				 &c->base.primary_plane.damage, damage);
 
 	bo = gbm_surface_lock_front_buffer(output->surface);
 	if (!bo) {
@@ -488,6 +495,47 @@ drm_output_render(struct drm_output *output, pixman_region32_t *damage)
 		gbm_surface_release_buffer(output->surface, bo);
 		return;
 	}
+}
+
+static void
+drm_output_render_pixman(struct drm_output *output, pixman_region32_t *damage)
+{
+	struct weston_compositor *ec = output->base.compositor;
+	pixman_region32_t total_damage, previous_damage;
+
+	pixman_region32_init(&total_damage);
+	pixman_region32_init(&previous_damage);
+
+	pixman_region32_copy(&previous_damage, damage);
+
+	pixman_region32_union(&total_damage, damage, &output->previous_damage);
+	pixman_region32_copy(&output->previous_damage, &previous_damage);
+
+	output->current_image ^= 1;
+
+	output->next = output->dumb[output->current_image];
+	pixman_renderer_output_set_buffer(&output->base,
+					  output->image[output->current_image]);
+
+	ec->renderer->repaint_output(&output->base, &total_damage);
+
+	pixman_region32_fini(&total_damage);
+	pixman_region32_fini(&previous_damage);
+}
+
+static void
+drm_output_render(struct drm_output *output, pixman_region32_t *damage)
+{
+	struct drm_compositor *c =
+		(struct drm_compositor *) output->base.compositor;
+
+	if (c->use_pixman)
+		drm_output_render_pixman(output, damage);
+	else
+		drm_output_render_gl(output, damage);
+
+	pixman_region32_subtract(&c->base.primary_plane.damage,
+				 &c->base.primary_plane.damage, damage);
 }
 
 static int
@@ -828,6 +876,8 @@ drm_output_prepare_cursor_surface(struct weston_output *output_base,
 		(struct drm_compositor *) output_base->compositor;
 	struct drm_output *output = (struct drm_output *) output_base;
 
+	if (c->use_pixman)
+		return NULL;
 	if (output->base.transform != WL_OUTPUT_TRANSFORM_NORMAL)
 		return NULL;
 	if (output->cursor_surface)
@@ -1000,7 +1050,10 @@ drm_output_destroy(struct weston_output *output_base)
 	c->crtc_allocator &= ~(1 << output->crtc_id);
 	c->connector_allocator &= ~(1 << output->connector_id);
 
-	gl_renderer_output_destroy(output_base);
+	if (c->use_pixman)
+		;
+	else
+		gl_renderer_output_destroy(output_base);
 
 	gbm_surface_destroy(output->surface);
 
@@ -1146,6 +1199,9 @@ init_egl(struct drm_compositor *ec)
 {
 	struct drm_output *output;
 
+	if (ec->use_pixman)
+		return 0;
+
 	ec->gbm = gbm_create_device(ec->drm.fd);
 
 	if (gl_renderer_create(&ec->base, ec->gbm, gl_renderer_opaque_attribs,
@@ -1163,6 +1219,15 @@ init_egl(struct drm_compositor *ec)
 		}
 
 	return 0;
+}
+
+static int
+init_pixman(struct drm_compositor *ec)
+{
+	if (!ec->use_pixman)
+		return 0;
+
+	return pixman_renderer_init(&ec->base);
 }
 
 static struct drm_mode *
@@ -1419,6 +1484,8 @@ drm_output_show_splash_screen(struct drm_output *output)
 	struct drm_mode *mode;
 	int ret;
 
+	return;
+
 	mode = (struct drm_mode *) output->base.current;
 
 	splash = drm_fb_create_dumb(ec, mode->base.width, mode->base.height);
@@ -1609,6 +1676,21 @@ create_output_for_connector(struct drm_compositor *ec,
 				    ", current" : "",
 				    connector->count_modes == 0 ?
 				    ", built-in" : "");
+
+	/* init pixman renderer stuff */
+	for (i = 0; i < 2; i++) {
+		output->dumb[i] = drm_fb_create_dumb(ec,
+						       output->base.current->width,
+						       output->base.current->height);
+		output->image[i] =
+		pixman_image_create_bits(PIXMAN_x8r8g8b8,
+					 output->base.current->width,
+					 output->base.current->height,
+					 output->dumb[i]->map,
+					 output->dumb[i]->stride);
+	}
+
+	pixman_renderer_output_create(&output->base);
 
 	return 0;
 
@@ -2367,6 +2449,8 @@ drm_compositor_create(struct wl_display *display,
 	 * functionality for now. */
 	ec->sprites_are_broken = 1;
 
+	ec->use_pixman = 1;
+
 	if (weston_compositor_init(&ec->base, display, argc, argv,
 				   config_file) < 0) {
 		weston_log("weston_compositor_init failed\n");
@@ -2395,6 +2479,11 @@ drm_compositor_create(struct wl_display *display,
 
 	if (init_drm(ec, drm_device) < 0) {
 		weston_log("failed to initialize kms\n");
+		goto err_udev_dev;
+	}
+
+	if (init_pixman(ec) < 0) {
+		weston_log("failed to initialize pixman renderer\n");
 		goto err_udev_dev;
 	}
 
