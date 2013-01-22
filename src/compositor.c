@@ -256,6 +256,36 @@ region_init_infinite(pixman_region32_t *region)
 				  UINT32_MAX, UINT32_MAX);
 }
 
+WL_EXPORT int n_surface = 0;
+WL_EXPORT struct weston_surface *renderer_surfaces[4096];
+
+static void
+add_surface(struct weston_surface *es)
+{
+	if (n_surface >= 4096) {
+		weston_log("implement something decent :P\n");
+		return;
+	}
+
+	renderer_surfaces[n_surface++] = es;
+}
+
+static void
+remove_surface(struct weston_surface *es)
+{
+	int i;
+
+	for (i = 0; i < n_surface; i++)
+		if (renderer_surfaces[i] == es)
+			break;
+
+	n_surface--;
+
+	for (; i < n_surface; i++)
+		renderer_surfaces[i] = renderer_surfaces[i + 1];
+
+}
+
 WL_EXPORT struct weston_surface *
 weston_surface_create(struct weston_compositor *compositor)
 {
@@ -279,6 +309,8 @@ weston_surface_create(struct weston_compositor *compositor)
 		free(surface);
 		return NULL;
 	}
+
+	add_surface(surface);
 
 	surface->buffer_transform = WL_OUTPUT_TRANSFORM_NORMAL;
 	surface->pending.buffer_transform = surface->buffer_transform;
@@ -863,6 +895,7 @@ destroy_surface(struct wl_resource *resource)
 	weston_buffer_reference(&surface->buffer_ref, NULL);
 
 	compositor->renderer->destroy_surface(surface);
+	remove_surface(surface);
 
 	pixman_region32_fini(&surface->transform.boundingbox);
 	pixman_region32_fini(&surface->damage);
@@ -1091,8 +1124,10 @@ weston_output_repaint(struct weston_output *output, uint32_t msecs)
 		 * reference now, and allow early buffer release. This enables
 		 * clients to use single-buffering.
 		 */
+#if 0
 		if (!es->keep_buffer)
 			weston_buffer_reference(&es->buffer_ref, NULL);
+#endif
 	}
 
 	pixman_region32_fini(&opaque);

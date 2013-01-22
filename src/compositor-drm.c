@@ -1255,6 +1255,42 @@ init_pixman(struct drm_compositor *ec)
 	return 0;
 }
 
+extern int n_surface;
+extern struct weston_surface *renderer_surfaces[];
+
+struct wl_buffer *r_buffers[4096];
+
+static void
+switch_to_egl(struct drm_compositor *ec)
+{
+	struct weston_output *output;
+	struct weston_surface *es;
+	int i;
+
+	for (i = 0; i < n_surface; i++) {
+		es = renderer_surfaces[i];
+
+		r_buffers[i] = es->buffer_ref.buffer;
+		if (r_buffers[i])
+			r_buffers[i]->busy_count++;
+
+		ec->base.renderer->attach(renderer_surfaces[i], NULL);
+		ec->base.renderer->destroy_surface(renderer_surfaces[i]);
+	}
+
+	wl_list_for_each(output, &ec->base.output_list, link)
+		pixman_renderer_output_destroy(output);
+
+	init_egl(ec);
+
+	for (i = 0; i < n_surface; i++) {
+		ec->base.renderer->create_surface(renderer_surfaces[i]);
+		ec->base.renderer->attach(renderer_surfaces[i], r_buffers[i]);
+		if (r_buffers[i])
+			r_buffers[i]->busy_count--;
+	}
+}
+
 static struct drm_mode *
 drm_output_add_mode(struct drm_output *output, drmModeModeInfo *info)
 {
@@ -2480,6 +2516,18 @@ find_primary_gpu(struct drm_compositor *ec, const char *seat)
 }
 
 static void
+pixman_binding(struct wl_seat *seat, uint32_t time, uint32_t key, void *data)
+{
+	struct drm_compositor *c = data;
+
+	if (!c->use_pixman)
+		return;
+
+	c->use_pixman = 0;
+	switch_to_egl(c);
+}
+
+static void
 planes_binding(struct wl_seat *seat, uint32_t time, uint32_t key, void *data)
 {
 	struct drm_compositor *c = data;
@@ -2621,6 +2669,8 @@ drm_compositor_create(struct wl_display *display,
 					    planes_binding, ec);
 	weston_compositor_add_debug_binding(&ec->base, KEY_V,
 					    planes_binding, ec);
+	weston_compositor_add_debug_binding(&ec->base, KEY_P,
+					    pixman_binding, ec);
 
 	return &ec->base;
 
