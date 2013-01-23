@@ -1124,7 +1124,7 @@ weston_output_repaint(struct weston_output *output, uint32_t msecs)
 		 * reference now, and allow early buffer release. This enables
 		 * clients to use single-buffering.
 		 */
-#if 0
+#if 1
 		if (!es->keep_buffer)
 			weston_buffer_reference(&es->buffer_ref, NULL);
 #endif

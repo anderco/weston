@@ -1270,11 +1270,13 @@ switch_to_egl(struct drm_compositor *ec)
 	for (i = 0; i < n_surface; i++) {
 		es = renderer_surfaces[i];
 
+#if 0
 		r_buffers[i] = es->buffer_ref.buffer;
 		if (r_buffers[i])
 			r_buffers[i]->busy_count++;
 
 		ec->base.renderer->attach(renderer_surfaces[i], NULL);
+#endif
 		ec->base.renderer->destroy_surface(renderer_surfaces[i]);
 	}
 
@@ -1284,10 +1286,20 @@ switch_to_egl(struct drm_compositor *ec)
 	init_egl(ec);
 
 	for (i = 0; i < n_surface; i++) {
-		ec->base.renderer->create_surface(renderer_surfaces[i]);
-		ec->base.renderer->attach(renderer_surfaces[i], r_buffers[i]);
-		if (r_buffers[i])
+		es = renderer_surfaces[i];
+		ec->base.renderer->create_surface(es);
+		if (es->buffer_ref.buffer) {
+			ec->base.renderer->attach(es, es->buffer_ref.buffer);
+			weston_surface_damage(es);
+		}
+#if 0
+		ec->base.renderer->attach(es, r_buffers[i]);
+		if (r_buffers[i]) {
 			r_buffers[i]->busy_count--;
+			/* force texture upload, whatever */
+			weston_surface_damage(es);
+		}
+#endif
 	}
 }
 
